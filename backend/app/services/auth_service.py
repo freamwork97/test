@@ -1,10 +1,13 @@
+import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 
 import redis.asyncio as aioredis
-from sqlalchemy import update
+from sqlalchemy import case, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
+
+logger = logging.getLogger(__name__)
 
 from app.core.config import settings
 from app.core.security import (
@@ -105,9 +108,7 @@ async def refresh_tokens(
     if cached is None:
         raise AuthError("Session not found in store")
 
-    user = await db.get(User, session_row.user_id)
-    if not user or not user.is_active:
-        raise AuthError("User not found or inactive")
+    user = await _get_user_by_id(db, session_row.user_id)
 
     # Mark session revoked in DB (Redis entry already removed by getdel above)
     session_row.revoked_at = datetime.now(timezone.utc)
@@ -140,7 +141,18 @@ async def logout_user(
         await _revoke_session(db, redis, session_row)
 
 
-async def get_current_user(db: AsyncSession, user_id: uuid.UUID) -> User:
+async def get_current_user(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    token_version: int,
+) -> User:
+    user = await _get_user_by_id(db, user_id)
+    if user.token_version != token_version:
+        raise AuthError("Token invalidated")
+    return user
+
+
+async def _get_user_by_id(db: AsyncSession, user_id: uuid.UUID) -> User:
     user = await db.get(User, user_id)
     if not user or not user.is_active:
         raise AuthError("User not found")
@@ -165,19 +177,23 @@ def _check_lockout(user: User) -> None:
 
 
 async def _record_failed_attempt(db: AsyncSession, user: User) -> None:
-    # H-5: atomic UPDATE ... SET count = count + 1 prevents lost-update race condition
+    # H-5: locked_until evaluated inside the UPDATE via DB-level case() expression.
+    # Both the count increment and the lock decision use the DB's current value,
+    # not the potentially-stale ORM object — safe under concurrent requests.
     now = datetime.now(timezone.utc)
-    lock_at = settings.MAX_LOGIN_ATTEMPTS - 1  # lock triggers when this increment hits max
+    lockout_time = now + timedelta(minutes=settings.LOCKOUT_DURATION_MINUTES)
 
     stmt = (
         update(User)
         .where(User.id == user.id)
         .values(
             failed_login_count=User.failed_login_count + 1,
-            locked_until=(
-                now + timedelta(minutes=settings.LOCKOUT_DURATION_MINUTES)
-                if user.failed_login_count >= lock_at
-                else user.locked_until
+            locked_until=case(
+                (
+                    User.failed_login_count + 1 >= settings.MAX_LOGIN_ATTEMPTS,
+                    lockout_time,
+                ),
+                else_=User.locked_until,
             ),
         )
     )
@@ -259,9 +275,15 @@ async def _revoke_all_user_sessions(
     )
     sessions = result.all()
     now = datetime.now(timezone.utc)
-    for s in sessions:
-        s.revoked_at = now
-        await redis.delete(f"{REFRESH_KEY_PREFIX}{s.token_hash}")
+
+    # Fix 3: bulk UPDATE instead of per-row loop
+    if sessions:
+        session_ids = [s.id for s in sessions]
+        await db.exec(  # type: ignore[arg-type]
+            update(RefreshSession)
+            .where(RefreshSession.id.in_(session_ids))  # type: ignore[attr-defined]
+            .values(revoked_at=now)
+        )
 
     # H-6: bump token_version so all existing access tokens are immediately invalid
     await db.exec(  # type: ignore[arg-type]
@@ -269,4 +291,13 @@ async def _revoke_all_user_sessions(
         .where(User.id == user_id)
         .values(token_version=User.token_version + 1)
     )
+
+    # Fix 2: DB commit BEFORE Redis deletes — fail-safe ordering
     await db.commit()
+
+    # Redis cleanup is best-effort after DB is consistent
+    for s in sessions:
+        try:
+            await redis.delete(f"{REFRESH_KEY_PREFIX}{s.token_hash}")
+        except Exception:
+            logger.warning("Redis delete failed for session %s — token expires via TTL", s.id)

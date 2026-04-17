@@ -156,13 +156,9 @@ async def me(
         raise HTTPException(status_code=401, detail="Invalid token")
 
     try:
-        user = await get_current_user(db, user_id)
+        user = await get_current_user(db, user_id, token_version=token_version)
     except AuthError as e:
         raise HTTPException(status_code=e.status_code, detail=e.message)
-
-    # Verify token version matches (catches force-logout via token_version bump)
-    if user.token_version != token_version:
-        raise HTTPException(status_code=401, detail="Token invalidated")
 
     return UserResponse(id=str(user.id), email=user.email, is_active=user.is_active)
 

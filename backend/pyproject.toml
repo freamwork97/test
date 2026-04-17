@@ -28,6 +28,7 @@ dev = [
     "anyio>=4.0.0",
     "aiosqlite>=0.22.1",
     "cryptography>=46.0.7",
+    "pytest-cov>=7.1.0",
 ]
 
 [tool.ruff]
